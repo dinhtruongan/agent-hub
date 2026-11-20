@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 
 from agenthub_local.config import Config
@@ -20,7 +21,44 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("init", help="interactive onboarding wizard (env, projects.json & IDE MCP config)")
     sub.add_parser("setup", help="maintainer: create channels, forums, tags and the maintainer role")
     sub.add_parser("doctor", help="check token, server and channels")
+    pj = sub.add_parser("project", help="project channels, members and local folder mapping")
+    pjs = pj.add_subparsers(dest="pcmd", required=True)
+    c = pjs.add_parser("create", help="maintainer: create private #proj-<id> + proj-<id>-tasks")
+    c.add_argument("id")
+    c.add_argument("--name", default="")
+    for name, hlp in (("grant", "maintainer: give a bot or human access"), ("revoke", "maintainer: remove access")):
+        g = pjs.add_parser(name, help=hlp)
+        g.add_argument("id")
+        g.add_argument("member_id", help="Discord user ID of the bot or human")
+    pjs.add_parser("list", help="projects on the server and their members")
+    mp = pjs.add_parser("map", help="this machine: the folder where this project lives")
+    mp.add_argument("id")
+    mp.add_argument("folder")
+    mp.add_argument("--lock", action="store_true", help="also install the Claude Code guard hook")
+    um = pjs.add_parser("unmap", help="this machine: stop accepting work for this project")
+    um.add_argument("id")
+    lk = pjs.add_parser("lock", help="install the Claude Code guard hook in the project folder")
+    lk.add_argument("id")
+    gd = sub.add_parser("guard", help="Claude Code PreToolUse hook: block paths outside --root")
+    gd.add_argument("--root", required=True)
     args = ap.parse_args(argv)
+
+    if args.cmd == "guard":
+        from agenthub_local.scope import guard_decision
+
+        try:
+            event = json.load(sys.stdin)
+        except json.JSONDecodeError:
+            event = {}
+        reason = guard_decision(event, args.root)
+        if reason:
+            print(f"AgentHub project scope: {reason}", file=sys.stderr)
+            raise SystemExit(2)  # exit 2 = Claude Code blocks the tool call and shows the reason
+        return
+
+    if args.cmd == "project" and args.pcmd in ("map", "unmap", "lock"):
+        _project_local(args)
+        return
 
     if args.cmd == "init":
         from agenthub_local.init_wizard import run_init_wizard
@@ -50,6 +88,31 @@ def main(argv: list[str] | None = None) -> None:
                 await rest.close()
             print("created: " + (", ".join(made) or "nothing (already set up)"))
         asyncio.run(go())
+    elif args.cmd == "project":
+        from agenthub_local import setup as st
+        from agenthub_local.discord_rest import DiscordREST
+        from agenthub_local.scope import check_project_id
+
+        pid = check_project_id(args.id) if getattr(args, "id", None) else ""
+
+        async def proj() -> None:
+            rest = DiscordREST(cfg.token, cfg.api_base)
+            try:
+                if args.pcmd == "create":
+                    made = await st.create_project(rest, cfg.guild_id, pid, args.name, cfg.maintainer_role)
+                    print("created: " + (", ".join(made) or "nothing (already exists)"))
+                    print(f"next: agenthub-local project grant {pid} <bot-or-user-id>")
+                elif args.pcmd == "grant":
+                    await st.grant_project(rest, cfg.guild_id, pid, args.member_id)
+                    print(f"granted {args.member_id} on project {pid}")
+                elif args.pcmd == "revoke":
+                    await st.revoke_project(rest, cfg.guild_id, pid, args.member_id)
+                    print(f"revoked {args.member_id} on project {pid}")
+                elif args.pcmd == "list":
+                    print(json.dumps(await st.list_projects(rest, cfg.guild_id), indent=1))
+            finally:
+                await rest.close()
+        asyncio.run(proj())
     elif args.cmd == "doctor":
         from agenthub_local.discord_rest import DiscordREST
         from agenthub_local.hub import Hub
@@ -70,3 +133,32 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main(sys.argv[1:])
+
+
+def _project_local(args) -> None:
+    """Folder mapping lives only on this machine and is changed only by the human, here."""
+    from pathlib import Path
+
+    from agenthub_local.projects import ProjectRegistry
+    from agenthub_local.scope import check_project_id, write_hook
+
+    home = Path(os.environ.get("AGENTHUB_HOME", str(Path.home() / ".agenthub")))
+    reg = ProjectRegistry(home)
+    pid = check_project_id(args.id)
+    if args.pcmd == "map":
+        folder = Path(args.folder).expanduser().resolve()
+        if not folder.is_dir():
+            raise SystemExit(f"not a folder: {folder}")
+        if folder == Path(folder.anchor) or folder == Path.home():
+            raise SystemExit("refusing to map a drive root or your home folder; pick the project folder")
+        out = reg.upsert(pid, str(folder), channel_ids=[])
+        print(json.dumps(out, indent=1, ensure_ascii=False))
+        if args.lock:
+            print(f"guard hook: {write_hook(folder)}")
+    elif args.pcmd == "unmap":
+        print(json.dumps(reg.remove(pid), indent=1))
+    elif args.pcmd == "lock":
+        local = reg.get(pid)
+        if local is None:
+            raise SystemExit(f"map it first: agenthub-local project map {pid} <folder>")
+        print(f"guard hook: {write_hook(local['path'])}")

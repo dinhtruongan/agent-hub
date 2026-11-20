@@ -148,7 +148,7 @@ async def test_multi_project_resolution_and_upload_containment(tmp_path):
             await h_script.send("bad", file=str(bad))
 
 
-async def test_hub_projects_mcp_tool_and_antigravity_config(tmp_path):
+async def test_hub_projects_mcp_tool_and_antigravity_config(tmp_path, monkeypatch):
     _, _, _, _, _, _, h_script, _ = await _setup_hub_team(tmp_path)
     server = build(h_script, Inbox(h_script.cfg.home))
     names = {t.name for t in await server.list_tools()}
@@ -156,6 +156,12 @@ async def test_hub_projects_mcp_tool_and_antigravity_config(tmp_path):
 
     proj = tmp_path / "my_repo"
     proj.mkdir()
+    # Agents may only change folder mappings when the owner opted in explicitly.
+    denied = await server.call_tool(
+        "hub_projects", {"action": "upsert", "project_id": "repo1", "path": str(proj)})
+    assert "only the human owner" in json.dumps([getattr(c, "text", "") for c in
+                                                  getattr(denied, "content", denied[0] if isinstance(denied, tuple) else denied)])
+    monkeypatch.setenv("AGENTHUB_AGENT_CAN_MAP_PROJECTS", "1")
     await server.call_tool(
         "hub_projects",
         {"action": "upsert", "project_id": "repo1", "path": str(proj), "aliases": ["repo1", "core"]},

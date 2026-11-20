@@ -26,6 +26,13 @@ from typing import Any
 
 from agenthub_local.config import Config
 from agenthub_local.discord_rest import MAX_UPLOAD, DiscordError, DiscordREST
+from agenthub_local.scope import (
+    PathGuard,
+    chat_channel_name,
+    check_project_id,
+    members_of,
+    tasks_forum_name,
+)
 
 VERIFY, REJECT, DEPRECATE = "✅", "❌", "🗑️"
 KINDS = ["requirement", "architecture", "decision", "constraint", "fact", "terminology", "note"]
@@ -85,6 +92,7 @@ class Hub:
         self._me: dict | None = None
         self._maint_role: str | None = None
         self._member_cache: dict[str, tuple[float, bool]] = {}
+        self.project: dict[str, Any] | None = None  # active project scope (see use_project)
         cfg.home.mkdir(parents=True, exist_ok=True)
         (cfg.home / "versions").mkdir(exist_ok=True)
 
@@ -105,6 +113,73 @@ class Hub:
         if c is None or c.get("type") != want_type:
             raise HubError(f"channel '{name}' not found; run `agenthub-local setup` first")
         return c
+
+    def _chat_name(self) -> str:
+        return self.project["chat"] if self.project else self.cfg.chat_channel
+
+    def _tasks_name(self) -> str:
+        return self.project["tasks"] if self.project else self.cfg.tasks_forum
+
+    # ---------------------------------------------------------------- projects
+    async def use_project(self, project_id: str) -> dict[str, Any]:
+        """Scope this agent to one project: its Discord channels and its local folder only.
+
+        Requires (1) the human mapped the project to a folder on this machine and (2) a
+        maintainer granted this bot access to `#proj-<id>` (Discord refuses the read otherwise).
+        """
+        from agenthub_local.projects import ProjectRegistry
+
+        try:
+            pid = check_project_id(project_id)
+        except ValueError as e:
+            raise HubError(str(e)) from e
+        local = ProjectRegistry(self.cfg.home).get(pid)
+        if local is None:
+            raise HubError(f"project '{pid}' is not mapped on this machine; the owner must run "
+                           f"`agenthub-local project map {pid} <folder>` first")
+        root = Path(str(local["path"])).expanduser().resolve()
+        if not root.is_dir():
+            raise HubError(f"project folder {root} does not exist on this machine")
+        self._channels = None  # refresh: channels may have been created since start
+        chat = await self._chan(chat_channel_name(pid), TEXT_TYPE)
+        await self._chan(tasks_forum_name(pid), FORUM_TYPE)
+        try:
+            await self.rest.messages(chat["id"], limit=1)
+        except DiscordError as e:
+            if e.status in (403, 404):
+                raise HubError(f"this agent is not a member of project '{pid}'; ask a maintainer to run "
+                               f"`agenthub-local project grant {pid} <bot id>`") from e
+            raise
+        self.project = {"id": pid, "root": str(root), "chat": chat_channel_name(pid),
+                        "tasks": tasks_forum_name(pid), "chat_id": chat["id"]}
+        return await self.project_info()
+
+    async def project_info(self) -> dict[str, Any]:
+        if not self.project:
+            return {"active": None, "note": "no project active: tools use #agent-chat and the global tasks forum"}
+        chat = (await self.channels()).get(self.project["chat"]) or {}
+        members = members_of(chat)
+        roster = {a["bot_id"]: a for a in await self.roster()}
+        return {"active": self.project["id"], "folder": self.project["root"],
+                "chat_channel": "#" + self.project["chat"], "tasks_forum": self.project["tasks"],
+                "members": [{"id": m, **({"name": roster[m].get("name"), "role": roster[m].get("role")}
+                                         if m in roster else {})} for m in sorted(members)],
+                "rules": "Only files inside folder may be read, written or uploaded. Only members can be "
+                         "@mentioned or assigned tasks."}
+
+    def check_path(self, path: str) -> dict[str, Any]:
+        if not self.project:
+            raise HubError("no project active; call hub_project_use first")
+        guard = PathGuard(self.project["root"])
+        return {"path": path, "allowed": guard.contains(path), "folder": str(guard.root)}
+
+    async def _require_members(self, ids: list[str]) -> None:
+        if not self.project or not ids:
+            return
+        chat = (await self.channels()).get(self.project["chat"]) or {}
+        outside = [i for i in ids if i not in members_of(chat)]
+        if outside:
+            raise HubError(f"not members of project '{self.project['id']}': {', '.join(outside)}")
 
     async def _tag_ids(self, forum: dict, names: list[str]) -> list[str]:
         by = {t["name"]: t["id"] for t in forum.get("available_tags") or []}
@@ -280,7 +355,8 @@ class Hub:
     # -------------------------------------------------------------------- chat
     async def send(self, text: str, to_bot_ids: list[str] | None = None, reply_to: str | None = None,
                    task_id: str | None = None, file: str | None = None) -> dict:
-        chan = await self._chan(self.cfg.chat_channel, TEXT_TYPE)
+        chan = await self._chan(self._chat_name(), TEXT_TYPE)
+        await self._require_members(list(to_bot_ids or []))
         hop = 0
         if reply_to:
             parent = await self.rest.message(chan["id"], reply_to)
@@ -292,7 +368,8 @@ class Hub:
             path = self._safe_upload(file)
         ids = list(dict.fromkeys(to_bot_ids or []))
         mentions = " ".join(f"<@{i}>" for i in ids)
-        meta = {"t": "msg", "hop": hop, "task": task_id, "owner": self.cfg.owner_id}
+        meta = {"t": "msg", "hop": hop, "task": task_id, "owner": self.cfg.owner_id,
+                **({"project": self.project["id"]} if self.project else {})}
         m = await self.rest.send(chan["id"], (mentions + " " + text).strip(), embed=meta_embed(meta),
                                  mention_user_ids=ids, file=path, reply_to=reply_to)
         return {"message_id": m["id"], "hop": hop}
@@ -300,7 +377,10 @@ class Hub:
     def _safe_upload(self, file: str) -> Path:
         from agenthub_local.projects import ProjectRegistry
 
-        roots = ProjectRegistry(self.cfg.home, self.cfg.upload_root).allowed_roots()
+        if self.project:  # inside a project: its folder only, never the other mappings
+            roots = [Path(self.project["root"])]
+        else:
+            roots = ProjectRegistry(self.cfg.home, self.cfg.upload_root).allowed_roots()
         if not roots:
             raise HubError("file upload disabled (set AGENTHUB_UPLOAD_ROOT or add a project via hub_projects)")
         p = Path(file).expanduser().resolve()
@@ -316,7 +396,7 @@ class Hub:
         return p
 
     async def history(self, limit: int = 30) -> list[dict]:
-        chan = await self._chan(self.cfg.chat_channel, TEXT_TYPE)
+        chan = await self._chan(self._chat_name(), TEXT_TYPE)
         out = []
         for m in reversed(await self.rest.messages(chan["id"], limit=limit)):
             out.append({"id": m["id"], "author": m["author"].get("username"), "author_id": m["author"]["id"],
@@ -327,7 +407,7 @@ class Hub:
     async def mentions_since(self, after: str | None) -> list[dict]:
         """Fallback inbox when the daemon is not running: scan chat for @mentions of me."""
         me = await self.me()
-        chan = await self._chan(self.cfg.chat_channel, TEXT_TYPE)
+        chan = await self._chan(self._chat_name(), TEXT_TYPE)
         msgs = await self.rest.messages(chan["id"], limit=100, after=after)
         return [{"id": m["id"], "author": m["author"].get("username"), "author_id": m["author"]["id"],
                  "bot": bool(m["author"].get("bot")), "content": m.get("content", "")[:1500],
@@ -336,15 +416,39 @@ class Hub:
                 if any(u["id"] == me["id"] for u in m.get("mentions") or []) and m["author"]["id"] != me["id"]]
 
     # ------------------------------------------------------------------- tasks
-    async def create_task(self, title: str, objectives: str, criteria: list[str]) -> dict:
-        forum = await self._chan(self.cfg.tasks_forum, FORUM_TYPE)
+    async def create_task(self, title: str, objectives: str, criteria: list[str],
+                          assignees: list[str] | None = None) -> dict:
+        """Create a task. In a project, it goes to `proj-<id>-tasks` and `assignees` (bot IDs of
+        project members, possibly on other people's machines) are pinged in `#proj-<id>`; only
+        they may claim it."""
+        assignees = list(dict.fromkeys(assignees or []))
+        if assignees and not self.project:
+            raise HubError("assigning agents requires an active project (hub_project_use)")
+        await self._require_members(assignees)
+        forum = await self._chan(self._tasks_name(), FORUM_TYPE)
         ctx = await self.context()
-        meta = {"t": "task", "criteria": criteria, "owner": self.cfg.owner_id,
+        me = await self.me()
+        meta = {"t": "task", "criteria": criteria, "owner": self.cfg.owner_id, "by": me["id"],
                 "context_version": ctx["context_version"]}
+        fields = [("Acceptance criteria", "\n".join(f"• {c}" for c in criteria))]
+        if self.project:
+            meta["project"] = self.project["id"]
+            fields.append(("Project", self.project["id"]))
+        if assignees:
+            meta["assignees"] = assignees
+            fields.append(("Assigned to", " ".join(f"<@{a}>" for a in assignees)))
         post = await self.rest.forum_post(
             forum["id"], title, objectives or title, await self._tag_ids(forum, ["backlog"]),
-            embed=meta_embed(meta, fields=[("Acceptance criteria", "\n".join(f"• {c}" for c in criteria))]))
-        return {"id": post["id"], "state": "backlog"}
+            embed=meta_embed(meta, fields=fields))
+        if assignees:
+            chan = await self._chan(self._chat_name(), TEXT_TYPE)
+            await self.rest.send(
+                chan["id"], " ".join(f"<@{a}>" for a in assignees)
+                + f" 📋 new task **{title[:80]}** (id `{post['id']}`): <#{post['id']}>. "
+                  "Claim it with hub_claim after hub_project_use.",
+                embed=meta_embed({"t": "assign", "hop": 0, "task": post["id"], "project": self.project["id"]}),
+                mention_user_ids=assignees)
+        return {"id": post["id"], "state": "backlog", "project": meta.get("project"), "assignees": assignees}
 
     async def _task_log(self, task_id: str) -> tuple[dict, list[dict]]:
         starter = await self.rest.message(task_id, task_id)
@@ -384,10 +488,11 @@ class Hub:
         return {"id": task_id, "title": chan.get("name"), "objectives": starter.get("content", ""),
                 "criteria": meta.get("criteria", []), "owner": meta.get("owner"),
                 "context_version": meta.get("context_version"), "state": state,
+                "project": meta.get("project"), "assignees": meta.get("assignees") or [],
                 "claimed_by": claimed_by, "handoff": handoff}
 
     async def tasks(self, state: str | None = None) -> list[dict]:
-        forum = await self._chan(self.cfg.tasks_forum, FORUM_TYPE)
+        forum = await self._chan(self._tasks_name(), FORUM_TYPE)
         out = []
         for t in await self._forum_threads(forum):
             try:
@@ -400,11 +505,16 @@ class Hub:
 
     async def claim(self, task_id: str) -> dict:
         before = await self.task(task_id)
+        me = await self.me()
+        if before.get("project") and (not self.project or self.project["id"] != before["project"]):
+            raise HubError(f"task belongs to project '{before['project']}'; call "
+                           f"hub_project_use('{before['project']}') first so you work in its folder")
+        if before.get("assignees") and me["id"] not in before["assignees"]:
+            raise HubError("task is assigned to other agents: " + ", ".join(before["assignees"]))
         if before["state"] not in ("backlog", "blocked"):
             raise HubError(f"task is {before['state']} (claimed by {before['claimed_by']})")
         await self.rest.send(task_id, "🙋 claiming this task", embed=meta_embed({"t": "claim"}))
         after = await self.task(task_id)
-        me = await self.me()
         if after["claimed_by"] != me["id"]:
             raise HubError(f"another agent claimed it first: <@{after['claimed_by']}>")
         await self._retag(task_id, "in_progress")
@@ -415,6 +525,8 @@ class Hub:
                       changes: list[str] | None = None) -> dict:
         t = await self.task(task_id)
         me = await self.me()
+        if t.get("project") and (not self.project or self.project["id"] != t["project"]):
+            raise HubError(f"task belongs to project '{t['project']}'; call hub_project_use first")
         if t["claimed_by"] != me["id"] or t["state"] != "in_progress":
             raise HubError("only the agent that claimed an in-progress task can hand it off")
         d = await self.drift(context_version, used_ids)
@@ -437,7 +549,7 @@ class Hub:
     async def _retag(self, thread_id: str, state: str) -> None:
         """Cosmetic: tags help humans browse. The derived state above is authoritative."""
         try:
-            forum = await self._chan(self.cfg.tasks_forum, FORUM_TYPE)
+            forum = await self._chan(self._tasks_name(), FORUM_TYPE)
             await self.rest.edit_thread(thread_id, applied_tags=await self._tag_ids(forum, [state]))
         except (HubError, DiscordError):
             pass  # tags are cosmetic; derived state is authoritative

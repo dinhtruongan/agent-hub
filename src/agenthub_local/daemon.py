@@ -25,6 +25,7 @@ from agenthub_local.hub import meta_of
 from agenthub_local.inbox import Inbox
 from agenthub_local.notify import notify
 from agenthub_local.projects import ProjectRegistry
+from agenthub_local.scope import project_of_channel_name
 
 log = logging.getLogger("agenthub.daemon")
 WAKE_LIMIT, WAKE_WINDOW = 5, 600
@@ -48,6 +49,24 @@ class WakeFilter:
             return False
         q.append(now)
         return True
+
+
+def workspace_for(reg: ProjectRegistry, channel_id: str, channel_name: str, parent_name: str,
+                  text: str) -> dict | None:
+    """Which local folder a mention should be handled in.
+
+    A mention inside a project channel (`#proj-<id>` or a thread of `proj-<id>-tasks`) maps ONLY to
+    that project's folder on this machine; if the owner never mapped it, return None (refuse).
+    Mentions elsewhere keep the old best-effort resolution (tags, aliases, default folder).
+    """
+    pid = project_of_channel_name(channel_name) or project_of_channel_name(parent_name)
+    if pid:
+        local = reg.get(pid)
+        if local is None:
+            return None
+        return {"project_id": pid, "project_name": str(local.get("name", pid)),
+                "workspace_path": str(local["path"]), "matched_by": "project_channel", "scoped": True}
+    return reg.resolve(channel_id, text)
 
 
 def _raw_message(m: discord.Message) -> dict:
@@ -77,7 +96,16 @@ class WakeDaemon(discord.Client):
             log.info("ignored mention from %s (hop %s / rate limit)", m.author, hop)
             return
         channel_name = getattr(m.channel, "name", "")
-        ws = ProjectRegistry(self.cfg.home, self.cfg.upload_root).resolve(str(m.channel.id), m.content or "")
+        parent = getattr(m.channel, "parent", None)
+        ws = workspace_for(ProjectRegistry(self.cfg.home, self.cfg.upload_root), str(m.channel.id),
+                           channel_name, getattr(parent, "name", "") or "", m.content or "")
+        if ws is None:
+            log.info("refused mention in #%s: project not mapped on this machine", channel_name)
+            try:
+                await m.add_reaction("⛔")
+            except discord.HTTPException:
+                pass
+            return
         item = {"id": str(m.id), "channel_id": str(m.channel.id), "channel": channel_name,
                 "author": m.author.name, "author_id": str(m.author.id), "bot": m.author.bot,
                 "hop": hop, "content": m.content[:3000], "url": m.jump_url,
@@ -85,6 +113,8 @@ class WakeDaemon(discord.Client):
         if ws.get("workspace_path"):
             item["project_id"] = ws["project_id"]
             item["workspace_path"] = ws["workspace_path"]
+            if ws.get("scoped"):
+                item["scoped"] = True  # agent must hub_project_use(project_id) and stay in the folder
         self.inbox.append(item)
         try:
             await m.add_reaction("👀")
@@ -94,8 +124,14 @@ class WakeDaemon(discord.Client):
         notify(f"{m.author.display_name} → {self.user.name}{proj_tag}", m.clean_content[:200])
         if self.wake_cmd:
             # Fixed argv, no shell, message text NOT passed: the agent reads it from the inbox.
+            # In a project, the command starts inside the project folder and is told which project.
+            env = dict(os.environ)
+            cwd = None
+            if ws.get("scoped"):
+                env.update(AGENTHUB_PROJECT=ws["project_id"], AGENTHUB_PROJECT_ROOT=ws["workspace_path"])
+                cwd = ws["workspace_path"]
             await asyncio.create_subprocess_exec(*self.wake_cmd, stdout=asyncio.subprocess.DEVNULL,
-                                                 stderr=asyncio.subprocess.DEVNULL)
+                                                 stderr=asyncio.subprocess.DEVNULL, env=env, cwd=cwd)
 
 
 def run(cfg: Config, wake_cmd: str | None = None) -> None:

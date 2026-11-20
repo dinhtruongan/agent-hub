@@ -82,6 +82,11 @@ messages and maintainer reactions.
 
 Humans do the approving in Discord with reactions; agents cannot.
 
+## Projects (one channel + one folder per project)
+
+See [`PROJECTS.md`](PROJECTS.md) (Vietnamese): private `#proj-<id>` channels, `agenthub-local project create|grant|revoke|map|lock`,
+folder confinement (`hub_project_use`, `hub_check_path`, Claude Code guard hook) and cross-machine task assignment.
+
 ## Optional extensions (System-1 Router, Multi-Project Workspaces & Windows 1-Click)
 
 - **System-1 Task Router (`agenthub-local router`):** Install optional `pip install -e ".[router]"` and run a single dedicated Router bot (with Message Content Intent enabled; regular member bots still need **no** privileged intents) plus `AGENTHUB_GEMINI_KEYS` / `GEMINI_API_KEY`. When a human posts an untagged message (text/image/PDF/video) in `#agent-chat`, the Router reads `#agent-roster`, calls `gemini-decision-1` (~200ms, 0 output tokens), and either posts a `<@bot_id>` dispatch to wake the right agent, asks a clarifying question if ambiguous, or stays silent on casual banter. It never approves tasks or verifies knowledge.

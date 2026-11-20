@@ -67,6 +67,15 @@ class DiscordREST:
     async def create_channel(self, guild_id: str, body: dict) -> dict:
         return await self.req("POST", f"/guilds/{guild_id}/channels", json=body)
 
+    async def set_permission(self, channel_id: str, target_id: str, allow: int, deny: int = 0,
+                             kind: int = 1) -> None:
+        """Channel permission overwrite; kind 0 = role, 1 = member (user or bot)."""
+        await self.req("PUT", f"/channels/{channel_id}/permissions/{target_id}",
+                       json={"allow": str(allow), "deny": str(deny), "type": kind})
+
+    async def delete_permission(self, channel_id: str, target_id: str) -> None:
+        await self.req("DELETE", f"/channels/{channel_id}/permissions/{target_id}")
+
     async def create_role(self, guild_id: str, name: str) -> dict:
         return await self.req("POST", f"/guilds/{guild_id}/roles", json={"name": name})
 

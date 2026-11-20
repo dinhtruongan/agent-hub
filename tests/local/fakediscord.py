@@ -47,6 +47,31 @@ class FakeDiscord:
         else:
             rs.append({"emoji": {"name": emoji}, "count": 1})
 
+    def can_view(self, user: dict, channel_id: str) -> bool:
+        """Discord-like VIEW_CHANNEL check using permission overwrites (threads inherit parent)."""
+        c = self.channels.get(channel_id)
+        if c is None:
+            return True
+        if c.get("type") == 11 and c.get("parent_id"):
+            return self.can_view(user, c["parent_id"])
+        ows = c.get("permission_overwrites") or []
+        view = 1 << 10
+        allowed = True
+        for ow in ows:
+            if ow["id"] == self.guild_id and int(ow.get("deny", 0)) & view:
+                allowed = False
+        for ow in ows:
+            if int(ow["type"]) == 0 and ow["id"] in self.members.get(user["id"], []) \
+                    and int(ow.get("allow", 0)) & view:
+                allowed = True
+        for ow in ows:
+            if int(ow["type"]) == 1 and ow["id"] == user["id"]:
+                if int(ow.get("allow", 0)) & view:
+                    allowed = True
+                if int(ow.get("deny", 0)) & view:
+                    allowed = False
+        return allowed
+
     def transport(self, token: str) -> httpx.MockTransport:
         return httpx.MockTransport(lambda req: self._handle(token, req))
 
@@ -88,7 +113,10 @@ class FakeDiscord:
             if m == "GET":
                 return J(list(self.channels.values()))
             c = {"id": sid(), "guild_id": g, "name": body["name"], "type": body["type"],
-                 "available_tags": [{"id": sid(), "name": t["name"]} for t in body.get("available_tags", [])]}
+                 "available_tags": [{"id": sid(), "name": t["name"]} for t in body.get("available_tags", [])],
+                 "permission_overwrites": [
+                     {"id": str(o["id"]), "type": int(o["type"]), "allow": str(o.get("allow", "0")),
+                      "deny": str(o.get("deny", "0"))} for o in body.get("permission_overwrites", [])]}
             self.channels[c["id"]] = c
             return J(c, 201)
         if P == f"/guilds/{g}/roles":
@@ -104,7 +132,19 @@ class FakeDiscord:
                 return J({"message": "Unknown Member"}, 404)
             return J({"user": {"id": uid}, "roles": self.members[uid]})
         if m == "GET" and P == f"/guilds/{g}/threads/active":
-            return J({"threads": [c for c in self.channels.values() if c["type"] == 11]})
+            return J({"threads": [c for c in self.channels.values() if c["type"] == 11 and self.can_view(me, c["id"])]})
+        mm = re.fullmatch(r"/channels/(\d+)/permissions/(\d+)", P)
+        if mm:
+            c = self.channels[mm.group(1)]
+            ows = [o for o in c.get("permission_overwrites", []) if o["id"] != mm.group(2)]
+            if m == "PUT":
+                ows.append({"id": mm.group(2), "type": int(body["type"]), "allow": str(body["allow"]),
+                            "deny": str(body.get("deny", "0"))})
+            c["permission_overwrites"] = ows
+            return httpx.Response(204)
+        mm = re.match(r"/channels/(\d+)", P)
+        if mm and not self.can_view(me, mm.group(1)):
+            return J({"message": "Missing Access", "code": 50001}, 403)
         mm = re.fullmatch(r"/channels/(\d+)/threads/archived/public", P)
         if mm:
             return J({"threads": [], "has_more": False})

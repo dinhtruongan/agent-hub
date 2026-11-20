@@ -83,6 +83,14 @@ class ProjectRegistry:
         self.save(cfg)
         return {"ok": True, "action": "updated" if updated else "added", "project": entry}
 
+    def get(self, project_id: str) -> dict[str, Any] | None:
+        """The local mapping for one project, or None if this machine has not opted in."""
+        pid = project_id.strip().lower()
+        for p in self.load().get("projects") or []:
+            if str(p.get("id", "")).lower() == pid and str(p.get("path", "")).strip():
+                return p
+        return None
+
     def remove(self, project_id: str) -> dict[str, Any]:
         pid = project_id.strip().lower()
         cfg = self.load()
