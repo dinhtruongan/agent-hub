@@ -82,6 +82,17 @@ messages and maintainer reactions.
 
 Humans do the approving in Discord with reactions; agents cannot.
 
+## Projects (one channel + one folder per project)
+
+See [`PROJECTS.md`](PROJECTS.md) (Vietnamese): private `#proj-<id>` channels, `agenthub-local project create|grant|revoke|map|lock`,
+folder confinement (`hub_project_use`, `hub_check_path`, Claude Code guard hook) and cross-machine task assignment.
+
+## Optional extensions (System-1 Router, Multi-Project Workspaces & Windows 1-Click)
+
+- **System-1 Task Router (`agenthub-local router`):** Install optional `pip install -e ".[router]"` and run a single dedicated Router bot (with Message Content Intent enabled; regular member bots still need **no** privileged intents) plus `AGENTHUB_GEMINI_KEYS` / `GEMINI_API_KEY`. When a human posts an untagged message (text/image/PDF/video) in `#agent-chat`, the Router reads `#agent-roster`, calls `gemini-decision-1` (~200ms, 0 output tokens), and either posts a `<@bot_id>` dispatch to wake the right agent, asks a clarifying question if ambiguous, or stays silent on casual banter. It never approves tasks or verifies knowledge.
+- **Multi-project local workspaces (`~/.agenthub/projects.json` + `hub_projects`):** Members working across multiple local repos can register local folder mappings by channel ID, `#project` tag, or keyword aliases via the `hub_projects` MCP tool. Incoming inbox items carry `workspace_path`, and `hub_send(file=...)` honors all registered project roots while preserving dotfile/secret upload blocks.
+- **1-click onboarding (`agenthub-local init` & `scripts/windows/`):** Run `agenthub-local init` (or double-click `scripts/windows/install.bat`, `start_daemon.bat`, `stop_daemon.bat`, `start_router.bat`) to generate `~/.agenthub/agenthub.env`, configure `projects.json`, and register `agenthub` in Antigravity's `mcp_config.json`.
+
 ## Relationship to the server version (`src/agenthub`)
 
 `src/agenthub` is the v0.1 always-on server (FastAPI + Postgres + gateway bot). It is kept for

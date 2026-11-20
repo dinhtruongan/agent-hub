@@ -242,7 +242,9 @@ async def test_mcp_tools_exposed_and_callable(team):
     assert {"hub_context", "hub_propose", "hub_handoff", "hub_debate_submit", "hub_wait", "hub_inbox"} <= names
     await server.call_tool("hub_propose", {"kind": "fact", "title": "T", "body": "B"})
     res = await server.call_tool("hub_context", {})
-    text = json.dumps([getattr(c, "text", "") for c in (res[0] if isinstance(res, tuple) else res)])
+    items = getattr(res, "content", res[0] if isinstance(res, tuple) else res)
+    text = json.dumps([getattr(c, "text", "") for c in items])
     assert "context_version" in text and "Proposed, NOT verified" in text
     bad = await server.call_tool("hub_propose", {"kind": "nope", "title": "T", "body": "B"})
-    assert "error" in json.dumps([getattr(c, "text", "") for c in (bad[0] if isinstance(bad, tuple) else bad)])
+    bad_items = getattr(bad, "content", bad[0] if isinstance(bad, tuple) else bad)
+    assert "error" in json.dumps([getattr(c, "text", "") for c in bad_items])
